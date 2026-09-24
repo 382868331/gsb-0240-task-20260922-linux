@@ -10,7 +10,11 @@ prints:
      exact Pareto pruning counts;
   2. a rejection boundary that is actually triggered (NaN and bool inputs);
   3. the distinction between a *proven* infeasible window set and a
-     budget cutoff whose result is explicitly not proven optimal.
+     budget cutoff whose result is explicitly not proven optimal;
+  4. the multi-corner problem: one shared physical option per edge with
+     per-corner delays, its proven optimum and per-corner verification
+     values, a cross-corner conflict proven infeasible, and an actual
+     over-limit rejection.
 """
 
 from __future__ import annotations
@@ -19,13 +23,19 @@ import time
 
 from skewbudget import (
     ClockTree,
+    Corner,
     Edge,
     InvalidNumericError,
     InputTypeError,
+    InputValueError,
     LeafWindow,
+    MultiCornerTree,
     Option,
+    PhysicalEdge,
+    PhysicalOption,
     Status,
     solve,
+    solve_multicorner,
 )
 
 
@@ -130,6 +140,73 @@ def main() -> None:
     full = solve(cut_tree, skew_limit=5)
     print(f"  same instance with the default exhaustive frontier:"
           f" {full.status.value}, cost {full.total_cost}")
+
+    hr("4. MULTI-CORNER -- one shared physical option, per-corner delays")
+    # Two leaves, two corners.  Base latency differs by corner:
+    #   fast: a=0, b=5   (b arrives 5 late)
+    #   slow: a=5, b=0   (a arrives 5 late)
+    # Every edge has the SAME physical catalogue (cost, fast-delay,
+    # slow-delay): idx0 (0,0,0) | idx1 (6,5,0) | idx2 (6,0,5).
+    # The option physically installed is shared across both corners, so
+    # corner-specific retiming must come from one option's delay vector.
+    mc_opts = [
+        PhysicalOption(0, (0, 0)),
+        PhysicalOption(6, (5, 0)),
+        PhysicalOption(6, (0, 5)),
+    ]
+    mc_tree = MultiCornerTree(
+        "r",
+        [PhysicalEdge("r", "a", (0, 5), mc_opts),
+         PhysicalEdge("r", "b", (5, 0), mc_opts)],
+        [Corner("fast", 0, [LeafWindow("a", 0, 9), LeafWindow("b", 0, 9)]),
+         Corner("slow", 0, [LeafWindow("a", 0, 9), LeafWindow("b", 0, 9)])],
+    )
+    mc = solve_multicorner(mc_tree)
+    print(f"  status={mc.status.value}  cost={mc.total_cost}  "
+          f"enumerated={mc.assignments_enumerated} "
+          f"(feasible {mc.feasible_assignments})")
+    for rpt in mc.corners:
+        print(f"  corner {rpt.name:>4}: arrivals={rpt.leaf_arrivals} "
+              f"skew={rpt.skew} (limit {rpt.skew_limit}) "
+              f"window_ok={rpt.window_ok}")
+    print(f"  physical picks: {mc.choices}  (a gets (5,0), b gets (0,5);")
+    print("   installing corner-specific buffers independently is not an"
+          " option -- cost 6+6 = 12)")
+    assert mc.status.value == "optimal" and mc.total_cost == 12
+    assert mc.choices == {"a": 1, "b": 2}
+
+    # Boundary: windows that no single physical vector can meet in both
+    # corners -- proven infeasible by exhaustive enumeration.
+    conflict = MultiCornerTree(
+        "r",
+        [PhysicalEdge("r", "a", (0, 0),
+                      [PhysicalOption(0, (0, 0)),
+                       PhysicalOption(1, (2, 2))])],
+        [Corner("fast", 0, [LeafWindow("a", 2, 2)]),
+         Corner("slow", 0, [LeafWindow("a", 0, 0)])],
+    )
+    bad = solve_multicorner(conflict)
+    print(f"  conflicting windows across corners: status="
+          f"{bad.status.value} (enumerated "
+          f"{bad.assignments_enumerated}, feasible "
+          f"{bad.feasible_assignments})")
+    assert bad.status.value == "infeasible" and bad.total_cost is None
+
+    # Actual rejection: the enumeration contract caps choice points at 8;
+    # a 9th multi-option edge is refused at construction (no half state).
+    try:
+        MultiCornerTree(
+            "r",
+            [PhysicalEdge("r", f"x{i}", (0,),
+                          [PhysicalOption(0, (0,)), PhysicalOption(1, (1,))])
+             for i in range(9)],
+            [Corner("c", 9, [LeafWindow(f"x{i}", 0, 99) for i in range(9)])],
+        )
+    except InputValueError as exc:
+        print(f"  triggered over-limit construction: "
+              f"{type(exc).__name__}: {exc}")
+    else:  # pragma: no cover - demo contract: this must never happen
+        raise AssertionError("9 choice points were silently accepted")
 
     print()
     print(f"demo finished in {time.perf_counter() - t0:.3f} s"
