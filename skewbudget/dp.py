@@ -42,9 +42,16 @@ reported :py:member:`Status.BUDGET_EXHAUSTED`: a feasible incumbent may be
 returned, but optimality is explicitly *not proven*; if no feasible state
 survives anywhere after a cutoff, feasibility is not proven either.
 :py:member:`Status.INFEASIBLE` is returned only when no cutoff happened and
-the root has no feasible state -- proof of impossibility and budget
-exhaustion are always kept apart.
-"""
+    the root has no feasible state -- proof of impossibility and budget
+    exhaustion are always kept apart.
+
+    Optional freeze / change-budget extension: 'frozen' maps edge ids
+    (child labels) to a forced option index; 'reference' is a complete
+    plan (every edge -> option index; indices must be legal, the plan
+    itself may be infeasible); 'max_changes' (K) caps how many edges may
+    deviate from the reference.  The edit count is a hard constraint,
+    never mixed into the objective; K=0 simply validates the reference.
+    """
 
 from __future__ import annotations
 
@@ -73,6 +80,9 @@ class PruningInfo:
                       empty (some leaf window could not be met jointly).
     skew_states:      joins whose leaf envelope already spanned more than S.
     budget_states:    assignments dropped solely by the frontier cap.
+    change_states:    joins/prunes whose subtree change count already
+                      exceeded the K cap (only nonzero when a reference
+                      plan and max_changes were supplied).
     cutoff_min_cost:  smallest subtree cost among budget-dropped states -- a
                       cutoff *record*, explicitly NOT an optimality bound;
                       None when nothing was dropped.
@@ -85,6 +95,7 @@ class PruningInfo:
     budget_states: int
     cutoff_min_cost: int | None
     nodes_visited: int
+    change_states: int = 0
 
     @property
     def truncated(self) -> bool:
@@ -105,6 +116,12 @@ class SolveResult:
     leaf_path_edges: dict[str, tuple[str, ...]]
     pruning: PruningInfo
     budget: int | None
+    # Freeze / change-budget extension (all None when not used):
+    changes: int | None = None        # edits vs the reference plan
+    modifications: dict[str, tuple[int, int]] | None = None  # edge -> (ref, new)
+    frozen: dict[str, int] | None = None      # edge -> forced option index
+    reference: dict[str, int] | None = None   # edge -> reference option index
+    max_changes: int | None = None            # K cap on edits vs reference
 
     @property
     def proven_optimal(self) -> bool:
@@ -119,6 +136,7 @@ class _State:
     whi: int | None
     cost: int
     vec: tuple[int, ...]
+    changes: int = 0
 
 
 @dataclass(slots=True)
@@ -126,6 +144,7 @@ class _Stats:
     dominated: int = 0
     window: int = 0
     skew: int = 0
+    changes: int = 0
     budget_drops: int = 0
     cutoff: int | None = None
     nodes: int = 0
@@ -182,6 +201,8 @@ def _dominates(k: _State, c: _State) -> bool:
     """
     if k.cost > c.cost:
         return False
+    if k.changes > c.changes:
+        return False
     if not (k.m >= c.m and k.M <= c.M):
         return False
     wlo_ok = (k.wlo is None) or (c.wlo is not None and k.wlo <= c.wlo)
@@ -197,7 +218,7 @@ def _pareto(states: list[_State], cap: int, st: _Stats) -> list[_State]:
     """Collapse equal signatures, apply exact dominance, optionally cap."""
     best: dict[tuple, _State] = {}
     for s in states:
-        key = (s.m, s.M, s.wlo, s.whi)
+        key = (s.m, s.M, s.wlo, s.whi, s.changes)
         old = best.get(key)
         if old is None or (s.cost, s.vec) < (old.cost, old.vec):
             if old is not None:
@@ -208,7 +229,7 @@ def _pareto(states: list[_State], cap: int, st: _Stats) -> list[_State]:
 
     pts = list(best.values())
     pts.sort(key=lambda s: (
-        s.cost, s.m, s.M,
+        s.cost, s.changes, s.m, s.M,
         s.wlo if s.wlo is not None else -_INF_WIDTH,
         s.whi if s.whi is not None else _INF_WIDTH,
         s.vec,
@@ -229,7 +250,7 @@ def _pareto(states: list[_State], cap: int, st: _Stats) -> list[_State]:
         # envelopes / flexible windows as secondary heuristics, and flag the
         # whole result unproven.
         kept.sort(key=lambda s: (s.cost, s.M, s.M - s.m,
-                                 _window_span(s), s.vec))
+                                 _window_span(s), s.changes, s.vec))
         for d in kept[cap:]:
             st.record_cutoff(d.cost)
         kept = kept[:cap]
@@ -255,7 +276,10 @@ def validate_tree(tree: ClockTree) -> dict:
 
 
 def solve(tree: ClockTree, skew_limit: int, *,
-          budget: int | None = DEFAULT_BUDGET) -> SolveResult:
+          budget: int | None = DEFAULT_BUDGET,
+          frozen: dict[str, int] | None = None,
+          reference: dict[str, int] | None = None,
+          max_changes: int | None = None) -> SolveResult:
     """Minimise total buffer cost under windows and the global skew bound.
 
     See module docstring for state/dominance semantics and
@@ -274,39 +298,133 @@ def solve(tree: ClockTree, skew_limit: int, *,
                 f"budget must be >= {MIN_BUDGET} or None, got {cap}"
             )
 
+    edge_by_child = tree.parent_edge
+
+    frozen_map: dict[str, int] = {}
+    if frozen is not None:
+        if not isinstance(frozen, dict):
+            raise InputTypeError(
+                "frozen must be a dict of edge id -> option index, got "
+                f"{type(frozen).__name__}"
+            )
+        for label, idx in frozen.items():
+            edge = edge_by_child.get(label)
+            if edge is None:
+                raise InputValueError(
+                    f"frozen edge {label!r} is not an edge of the tree"
+                )
+            i = _check_int(idx, f"frozen[{label!r}]")
+            if not 0 <= i < len(edge.options):
+                raise InputValueError(
+                    f"frozen[{label!r}] = {i} is out of range for edge "
+                    f"{edge.parent!r}->{edge.child!r} with "
+                    f"{len(edge.options)} option(s)"
+                )
+            frozen_map[label] = i
+
+    ref_map: dict[str, int] | None = None
+    if reference is not None:
+        if not isinstance(reference, dict):
+            raise InputTypeError(
+                "reference must be a dict of edge id -> option index, got "
+                f"{type(reference).__name__}"
+            )
+        want = set(edge_by_child)
+        got = set(reference)
+        if got != want:
+            missing = sorted(want - got)
+            extra = sorted(got - want)
+            raise InputValueError(
+                "reference must assign exactly one option per edge; "
+                f"missing={missing} extra={extra}"
+            )
+        ref_map = {}
+        for label, idx in reference.items():
+            edge = edge_by_child[label]
+            i = _check_int(idx, f"reference[{label!r}]")
+            if not 0 <= i < len(edge.options):
+                raise InputValueError(
+                    f"reference[{label!r}] = {i} is out of range for edge "
+                    f"{edge.parent!r}->{edge.child!r} with "
+                    f"{len(edge.options)} option(s)"
+                )
+            ref_map[label] = i
+
+    if max_changes is None:
+        if ref_map is not None:
+            raise InputValueError(
+                "max_changes (K) is required when a reference plan is given"
+            )
+        k_cap: int | None = None
+    else:
+        k_cap = _check_int(max_changes, "max_changes")
+        if k_cap < 0:
+            raise InputValueError(f"max_changes must be >= 0, got {k_cap}")
+        if ref_map is None:
+            raise InputValueError(
+                "max_changes requires a reference plan to count edits against"
+            )
+
     stats = _Stats()
     children = tree.children
     windows = {w.leaf: w for w in tree.windows}
+
+    def edge_options(edge, child_label):
+        """(index, option, edit-delta) triples this edge may still take."""
+        if child_label in frozen_map:
+            i = frozen_map[child_label]
+            delta = 0
+            if ref_map is not None and i != ref_map[child_label]:
+                delta = 1
+            return ((i, edge.options[i], delta),)
+        if ref_map is None:
+            return tuple((i, opt, 0)
+                         for i, opt in enumerate(edge.options))
+        ref_i = ref_map[child_label]
+        return tuple(
+            (i, opt, 0 if i == ref_i else 1)
+            for i, opt in enumerate(edge.options)
+        )
 
     def node_dp(v: str) -> list[_State]:
         stats.nodes += 1
         kids = children.get(v)
         if not kids:
             w = windows[v]
-            return [_State(0, 0, w.lo, w.hi, 0, ())]
+            return [_State(0, 0, w.lo, w.hi, 0, (), 0)]
 
         frontier: list[_State] = []
         first = True
         for ch, edge in sorted(kids, key=lambda x: x[0]):
             child_states = node_dp(ch)
+            opts = edge_options(edge, ch)
             produced: list[_State] = []
             if first:
                 # No earlier siblings: envelope and prefix set come straight
                 # from this child, shifted across the parent edge.
                 for cs in child_states:
-                    for opt_idx, opt in enumerate(edge.options):
+                    for opt_idx, opt, delta in opts:
+                        n_changes = cs.changes + delta
+                        if k_cap is not None and n_changes > k_cap:
+                            stats.changes += 1
+                            continue
                         d = edge.base_delay + opt.delay
                         wlo, whi = _shift(cs.wlo, cs.whi, d)
                         produced.append(_State(
                             cs.m + d, cs.M + d, wlo, whi,
                             cs.cost + opt.cost, (opt_idx,) + cs.vec,
+                            n_changes,
                         ))
                 first = False
             else:
                 for fs in frontier:
-                    for opt_idx, opt in enumerate(edge.options):
+                    for opt_idx, opt, delta in opts:
                         d = edge.base_delay + opt.delay
                         for cs in child_states:
+                            n_changes = fs.changes + delta + cs.changes
+                            if k_cap is not None and n_changes > k_cap:
+                                stats.changes += 1
+                                continue
                             wlo, whi = _shift(cs.wlo, cs.whi, d)
                             wint = _intersect(
                                 (fs.wlo, fs.whi), (wlo, whi)
@@ -325,29 +443,34 @@ def solve(tree: ClockTree, skew_limit: int, *,
                                 em, eM, wint[0], wint[1],
                                 fs.cost + opt.cost + cs.cost,
                                 fs.vec + (opt_idx,) + cs.vec,
+                                n_changes,
                             ))
             frontier = _pareto(produced, cap, stats)
         return frontier
 
     # Degenerate tree: a lone root, no edges or leaves.  Nothing to choose.
     if tree.n_edges == 0:
-        root_states = [_State(0, 0, None, None, 0, ())]
+        root_states = [_State(0, 0, None, None, 0, (), 0)]
     else:
         root_states = node_dp(tree.root)
 
     feasible = [
         s for s in root_states
         if (s.wlo is None or s.wlo <= 0) and (s.whi is None or 0 <= s.whi)
+        and (k_cap is None or s.changes <= k_cap)
     ]
     info = PruningInfo(
         stats.dominated, stats.window, stats.skew,
-        stats.budget_drops, stats.cutoff, stats.nodes,
+        stats.budget_drops, stats.cutoff, stats.nodes, stats.changes,
     )
 
     def no_incumbent(reason: Status) -> SolveResult:
         return SolveResult(
             reason, tree, s_limit, None, None, None, None,
             {}, {}, {}, info, budget,
+            frozen=dict(frozen_map) if frozen is not None else None,
+            reference=dict(ref_map) if ref_map is not None else None,
+            max_changes=k_cap,
         )
 
     if not feasible:
@@ -362,10 +485,22 @@ def solve(tree: ClockTree, skew_limit: int, *,
     status = Status.BUDGET_EXHAUSTED if info.truncated else Status.OPTIMAL
 
     choices, arrivals, paths = _reconstruct(tree, best.vec)
+    modifications = None
+    if ref_map is not None:
+        modifications = {
+            label: (ref_map[label], choices[label])
+            for label in choices
+            if choices[label] != ref_map[label]
+        }
     return SolveResult(
         status, tree, s_limit,
         best.cost, best.M, best.m, best.M - best.m,
         choices, arrivals, paths, info, budget,
+        changes=best.changes if ref_map is not None else None,
+        modifications=modifications,
+        frozen=dict(frozen_map) if frozen is not None else None,
+        reference=dict(ref_map) if ref_map is not None else None,
+        max_changes=k_cap,
     )
 
 

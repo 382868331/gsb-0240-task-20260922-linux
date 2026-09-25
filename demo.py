@@ -131,6 +131,30 @@ def main() -> None:
     print(f"  same instance with the default exhaustive frontier:"
           f" {full.status.value}, cost {full.total_cost}")
 
+    hr("4. FROZEN EDGES + CHANGE BUDGET K vs a reference plan")
+    tree = build_tree()
+    # Pin the shared trunk to its +2 buffer; one pin moves both leaves.
+    frozen_res = solve(tree, skew_limit=0, frozen={"u": 1})
+    show("trunk edge u frozen to option 1, S=0", frozen_res)
+    assert frozen_res.choices["u"] == 1
+    print("  frozen pin survived all pruning; both leaves share the"
+          " shifted trunk arrival.")
+
+    # Reference plan = all zero buffers (itself infeasible at S=0);
+    # allow at most K=1 edge to deviate.
+    reference = {"u": 0, "a": 0, "b": 0}
+    ref_res = solve(tree, skew_limit=0, reference=reference, max_changes=1)
+    show("reference all-zero plan, K=1 edit allowed", ref_res)
+    print(f"  edits vs reference: {ref_res.changes} (K=1)")
+    print(f"  modifications     : {ref_res.modifications}"
+          "  (edge -> (reference idx, chosen idx))")
+    print(f"  per-leaf paths    : {ref_res.leaf_path_edges}")
+    print(f"  per-leaf arrivals : {ref_res.leaf_arrivals}")
+    k0 = solve(tree, skew_limit=0, reference=reference, max_changes=0)
+    print(f"  K=0 just validates the reference plan -> {k0.status.value}"
+          " (the all-zero plan has skew 3 > 0, so it is infeasible)")
+    assert k0.status is Status.INFEASIBLE
+
     print()
     print(f"demo finished in {time.perf_counter() - t0:.3f} s"
           " (all numbers computed now from the fixed inputs above).")
