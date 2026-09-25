@@ -105,10 +105,30 @@ class SolveResult:
     leaf_path_edges: dict[str, tuple[str, ...]]
     pruning: PruningInfo
     budget: int | None
+    # Reference-constrained solving (solve_with_reference) extras; empty /
+    # None for plain solve().  Never part of the objective.
+    modifications: tuple = ()          # tuple[Modification, ...]
+    max_changes: int | None = None
+    n_changes: int | None = None
 
     @property
     def proven_optimal(self) -> bool:
         return self.status is Status.OPTIMAL
+
+
+@dataclass(frozen=True)
+class Modification:
+    """One edge whose chosen option differs from the reference plan.
+
+    edge:             child-endpoint label identifying the edge.
+    reference_index:  option index the reference plan assigned.
+    chosen_index:     option index actually chosen.
+    Frozen edges never appear here (they are not counted as changes).
+    """
+
+    edge: str
+    reference_index: int
+    chosen_index: int
 
 
 @dataclass(slots=True)
@@ -119,6 +139,7 @@ class _State:
     whi: int | None
     cost: int
     vec: tuple[int, ...]
+    ch: int = 0   # changes vs the reference plan so far (constraint only)
 
 
 @dataclass(slots=True)
@@ -179,8 +200,13 @@ def _dominates(k: _State, c: _State) -> bool:
     vector, hence local vec order equals root vec order for every identical
     continuation.  A subtree-strict M is NOT enough by itself, because a
     sibling leaf may supply the global maximum and make root M tie.
+    Change counts only constrain (<= K), never optimise: a state with no
+    more changes is feasible wherever a more-changed one is, so k must
+    also satisfy k.ch <= c.ch.
     """
     if k.cost > c.cost:
+        return False
+    if k.ch > c.ch:
         return False
     if not (k.m >= c.m and k.M <= c.M):
         return False
@@ -197,7 +223,7 @@ def _pareto(states: list[_State], cap: int, st: _Stats) -> list[_State]:
     """Collapse equal signatures, apply exact dominance, optionally cap."""
     best: dict[tuple, _State] = {}
     for s in states:
-        key = (s.m, s.M, s.wlo, s.whi)
+        key = (s.m, s.M, s.wlo, s.whi, s.ch)
         old = best.get(key)
         if old is None or (s.cost, s.vec) < (old.cost, old.vec):
             if old is not None:
@@ -229,7 +255,7 @@ def _pareto(states: list[_State], cap: int, st: _Stats) -> list[_State]:
         # envelopes / flexible windows as secondary heuristics, and flag the
         # whole result unproven.
         kept.sort(key=lambda s: (s.cost, s.M, s.M - s.m,
-                                 _window_span(s), s.vec))
+                                 _window_span(s), s.ch, s.vec))
         for d in kept[cap:]:
             st.record_cutoff(d.cost)
         kept = kept[:cap]
@@ -265,18 +291,110 @@ def solve(tree: ClockTree, skew_limit: int, *,
     s_limit = _check_int(skew_limit, "skew_limit")
     if s_limit < 0:
         raise InputValueError(f"skew_limit must be >= 0, got {s_limit}")
-    if budget is None:
-        cap = -1
-    else:
-        cap = _check_int(budget, "budget")
-        if cap < MIN_BUDGET:
-            raise InputValueError(
-                f"budget must be >= {MIN_BUDGET} or None, got {cap}"
-            )
-
+    cap = _budget_cap(budget)
     stats = _Stats()
+    root_states = _run_dp(tree, s_limit, cap, stats, None, None, 0)
+    return _finish(tree, s_limit, root_states, stats, budget, None, None, None)
+
+
+def _budget_cap(budget: int | None) -> int:
+    if budget is None:
+        return -1
+    cap = _check_int(budget, "budget")
+    if cap < MIN_BUDGET:
+        raise InputValueError(
+            f"budget must be >= {MIN_BUDGET} or None, got {cap}"
+        )
+    return cap
+
+
+def _check_option_table(table, what: str, tree: ClockTree,
+                        require_full: bool) -> dict[str, int]:
+    """Validate a {child label: option index} mapping against the tree."""
+    from collections.abc import Mapping
+    if not isinstance(table, Mapping):
+        raise InputTypeError(
+            f"{what} must be a mapping {{edge child label: option index}}, "
+            f"got {type(table).__name__}"
+        )
+    out: dict[str, int] = {}
+    for label, idx in table.items():
+        if not isinstance(label, str) or label not in tree.edge_index:
+            raise InputValueError(
+                f"{what}: {label!r} is not an edge (child label) of the tree"
+            )
+        i = _check_int(idx, f"{what}[{label!r}]")
+        n_opt = len(tree.parent_edge[label].options)
+        if not 0 <= i < n_opt:
+            raise InputValueError(
+                f"{what}[{label!r}] = {i} out of range "
+                f"[0, {n_opt}) for that edge's options"
+            )
+        out[label] = i
+    if require_full:
+        missing = sorted(set(tree.edge_index) - set(out))
+        if missing:
+            raise InputValueError(
+                f"{what} must assign an option index to every edge; "
+                f"missing: {missing}"
+            )
+    return out
+
+
+def solve_with_reference(tree: ClockTree, skew_limit: int,
+                         reference, max_changes: int, *,
+                         frozen=None,
+                         budget: int | None = DEFAULT_BUDGET) -> SolveResult:
+    """Solve under a freeze table and a change budget vs a reference plan.
+
+    reference:   {edge child label: option index} covering EVERY edge; the
+                 plan itself may be infeasible, but every index must be a
+                 legal option index of its edge.
+    max_changes: at most this many *non-frozen* edges may choose an option
+                 different from the reference (K).  K=0 merely validates
+                 the reference plan (frozen edges still override it).
+    frozen:      optional {edge child label: option index}; those edges
+                 MUST use exactly that option.  A frozen edge is never
+                 pruned into another option and never counts as a change.
+
+    The objective is unchanged -- lexicographic (total cost, max leaf
+    delay, option vector); the change count is a constraint only and is
+    never mixed into the cost.  Status semantics match :func:`solve`:
+    budget exhaustion is reported separately from proven infeasibility.
+    """
+    validate_tree(tree)
+    s_limit = _check_int(skew_limit, "skew_limit")
+    if s_limit < 0:
+        raise InputValueError(f"skew_limit must be >= 0, got {s_limit}")
+    kmax = _check_int(max_changes, "max_changes")
+    if kmax < 0:
+        raise InputValueError(f"max_changes must be >= 0, got {kmax}")
+    ref = _check_option_table(reference, "reference", tree, require_full=True)
+    frz = (_check_option_table(frozen, "frozen", tree, require_full=False)
+           if frozen is not None else {})
+    cap = _budget_cap(budget)
+    stats = _Stats()
+    root_states = _run_dp(tree, s_limit, cap, stats, frz, ref, kmax)
+    return _finish(tree, s_limit, root_states, stats, budget, ref, frz, kmax)
+
+
+def _run_dp(tree: ClockTree, s_limit: int, cap: int, stats: _Stats,
+            frozen: dict[str, int] | None,
+            ref: dict[str, int] | None, kmax: int) -> list[_State]:
+    """Shared exact DP.  frozen/ref restrict per-edge option iteration and
+    seed the change counter; both None gives the plain solve behaviour."""
     children = tree.children
     windows = {w.leaf: w for w in tree.windows}
+
+    def edge_options(edge) -> tuple[tuple[int, int], ...]:
+        # (option index, change increment) pairs allowed on this edge.
+        if frozen is not None and edge.child in frozen:
+            return ((frozen[edge.child], 0),)
+        if ref is None:
+            return tuple((i, 0) for i in range(len(edge.options)))
+        ridx = ref[edge.child]
+        return tuple((i, 0 if i == ridx else 1)
+                     for i in range(len(edge.options)))
 
     def node_dp(v: str) -> list[_State]:
         stats.nodes += 1
@@ -290,23 +408,32 @@ def solve(tree: ClockTree, skew_limit: int, *,
         for ch, edge in sorted(kids, key=lambda x: x[0]):
             child_states = node_dp(ch)
             produced: list[_State] = []
+            allowed = edge_options(edge)
             if first:
                 # No earlier siblings: envelope and prefix set come straight
                 # from this child, shifted across the parent edge.
                 for cs in child_states:
-                    for opt_idx, opt in enumerate(edge.options):
+                    for opt_idx, dch in allowed:
+                        nch = cs.ch + dch
+                        if nch > kmax:
+                            continue
+                        opt = edge.options[opt_idx]
                         d = edge.base_delay + opt.delay
                         wlo, whi = _shift(cs.wlo, cs.whi, d)
                         produced.append(_State(
                             cs.m + d, cs.M + d, wlo, whi,
-                            cs.cost + opt.cost, (opt_idx,) + cs.vec,
+                            cs.cost + opt.cost, (opt_idx,) + cs.vec, nch,
                         ))
                 first = False
             else:
                 for fs in frontier:
-                    for opt_idx, opt in enumerate(edge.options):
+                    for opt_idx, dch in allowed:
+                        opt = edge.options[opt_idx]
                         d = edge.base_delay + opt.delay
                         for cs in child_states:
+                            nch = fs.ch + dch + cs.ch
+                            if nch > kmax:
+                                continue
                             wlo, whi = _shift(cs.wlo, cs.whi, d)
                             wint = _intersect(
                                 (fs.wlo, fs.whi), (wlo, whi)
@@ -324,7 +451,7 @@ def solve(tree: ClockTree, skew_limit: int, *,
                             produced.append(_State(
                                 em, eM, wint[0], wint[1],
                                 fs.cost + opt.cost + cs.cost,
-                                fs.vec + (opt_idx,) + cs.vec,
+                                fs.vec + (opt_idx,) + cs.vec, nch,
                             ))
             frontier = _pareto(produced, cap, stats)
         return frontier
@@ -334,7 +461,14 @@ def solve(tree: ClockTree, skew_limit: int, *,
         root_states = [_State(0, 0, None, None, 0, ())]
     else:
         root_states = node_dp(tree.root)
+    return root_states
 
+
+def _finish(tree: ClockTree, s_limit: int, root_states: list[_State],
+            stats: _Stats, budget: int | None,
+            ref: dict[str, int] | None,
+            frz: dict[str, int] | None,
+            kmax: int | None) -> SolveResult:
     feasible = [
         s for s in root_states
         if (s.wlo is None or s.wlo <= 0) and (s.whi is None or 0 <= s.whi)
@@ -347,7 +481,7 @@ def solve(tree: ClockTree, skew_limit: int, *,
     def no_incumbent(reason: Status) -> SolveResult:
         return SolveResult(
             reason, tree, s_limit, None, None, None, None,
-            {}, {}, {}, info, budget,
+            {}, {}, {}, info, budget, (), kmax, None,
         )
 
     if not feasible:
@@ -362,10 +496,23 @@ def solve(tree: ClockTree, skew_limit: int, *,
     status = Status.BUDGET_EXHAUSTED if info.truncated else Status.OPTIMAL
 
     choices, arrivals, paths = _reconstruct(tree, best.vec)
+    modifications: tuple = ()
+    n_changes = None
+    if ref is not None:
+        mods = []
+        for child, _idx in sorted(tree.edge_index.items(),
+                                  key=lambda kv: kv[1]):
+            if frz and child in frz:
+                continue
+            if choices[child] != ref[child]:
+                mods.append(Modification(child, ref[child], choices[child]))
+        modifications = tuple(mods)
+        n_changes = len(mods)
     return SolveResult(
         status, tree, s_limit,
         best.cost, best.M, best.m, best.M - best.m,
         choices, arrivals, paths, info, budget,
+        modifications, kmax, n_changes,
     )
 
 

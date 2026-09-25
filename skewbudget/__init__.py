@@ -2,8 +2,8 @@
 
 Public API:
     Option, Edge, LeafWindow, ClockTree -- input data structures
-    Status, SolveResult, PruningInfo    -- output data structures
-    solve, validate_tree                -- algorithm / eager validation
+    Status, SolveResult, PruningInfo, Modification -- output structures
+    solve, solve_with_reference, validate_tree     -- algorithms / validation
     SkewBudgetError and subclasses      -- error semantics
 """
 
@@ -19,7 +19,15 @@ from .model import (
     SkewBudgetError,
     TreeValidationError,
 )
-from .dp import PruningInfo, SolveResult, Status, solve, validate_tree
+from .dp import (
+    Modification,
+    PruningInfo,
+    SolveResult,
+    Status,
+    solve,
+    solve_with_reference,
+    validate_tree,
+)
 
 __all__ = [
     "MAX_EDGES",
@@ -30,7 +38,9 @@ __all__ = [
     "Status",
     "SolveResult",
     "PruningInfo",
+    "Modification",
     "solve",
+    "solve_with_reference",
     "validate_tree",
     "SkewBudgetError",
     "InputTypeError",

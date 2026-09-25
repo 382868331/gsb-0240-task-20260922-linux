@@ -13,15 +13,34 @@ from itertools import product
 from skewbudget.model import ClockTree
 
 
-def enumerate_solutions(tree: ClockTree, skew_limit: int):
-    """Return all feasible assignments as dicts child_label -> option idx."""
+def enumerate_solutions(tree: ClockTree, skew_limit: int,
+                        reference=None, max_changes=None, frozen=None):
+    """Return all feasible assignments as dicts child_label -> option idx.
+
+    With ``reference``/``max_changes``/``frozen`` only assignments that
+    honour the freeze table and differ from the reference on at most
+    ``max_changes`` non-frozen edges are kept.
+    """
     edges_by_child = {ch: e for e in tree.edges for ch in (e.child,)}
     children_sorted = sorted(edges_by_child)
-    choices_ranges = [range(len(edges_by_child[ch].options))
-                      for ch in children_sorted]
+    frozen = frozen or {}
+
+    def allowed(ch):
+        if ch in frozen:
+            return (frozen[ch],)
+        return range(len(edges_by_child[ch].options))
+
+    choices_ranges = [allowed(ch) for ch in children_sorted]
     out = []
     for combo in product(*choices_ranges):
         choice = dict(zip(children_sorted, combo))
+        if reference is not None and max_changes is not None:
+            n_diff = sum(
+                1 for ch in children_sorted
+                if ch not in frozen and choice[ch] != reference[ch]
+            )
+            if n_diff > max_changes:
+                continue
         arrivals = {}
         for leaf in tree.leaf_set:
             total = 0
@@ -51,9 +70,11 @@ def enumerate_solutions(tree: ClockTree, skew_limit: int):
     return out
 
 
-def optimal_reference(tree: ClockTree, skew_limit: int):
+def optimal_reference(tree: ClockTree, skew_limit: int,
+                      reference=None, max_changes=None, frozen=None):
     """Canonical optimum: min (cost, max delay, option vector)."""
-    feasible = enumerate_solutions(tree, skew_limit)
+    feasible = enumerate_solutions(tree, skew_limit,
+                                   reference, max_changes, frozen)
     if not feasible:
         return None
     # Canonical vector follows the tree's public DFS-preorder edge slots.

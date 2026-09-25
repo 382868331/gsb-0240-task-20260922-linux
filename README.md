@@ -51,6 +51,37 @@ res.leaf_path_edges   # {叶: 路径上的边(以子端点名标识),根→叶�
 res.pruning           # 被剪枝状态分类计数与预算界,见下
 ```
 
+### 冻结选项表 + 相对参考方案的改动预算
+
+```python
+from skewbudget import solve_with_reference, Modification
+
+res = solve_with_reference(
+    tree, skew_limit=3,
+    reference={"u": 0, "a": 0, "b": 0},   # 既有方案:每边一个合法选项下标
+    max_changes=1,                        # K:非冻结边最多改动 1 处
+    frozen={"u": 1},                      # 冻结表:这些边焊死为指定选项
+    # budget 语义与 solve 相同
+)
+res.n_changes         # 实际改动处数(<= K,不计冻结边)
+res.modifications     # tuple[Modification]:每处改动
+                      #   .edge 边的子端点名 / .reference_index / .chosen_index
+res.choices           # 冻结边恒为冻结下标,不会被剪枝换掉
+res.leaf_path_edges   # 逐叶路径(根→叶的边序列),便于核对改动约束
+```
+
+- `reference` 必须给**每条边**一个合法选项下标(下标越界/缺边/类型错误
+  直接抛 `InputValueError`/`InputTypeError`);参考方案**本身可以不可行**,
+  它只作为改动计数基准。`K=0` 即只验证参考方案(冻结边仍覆盖它)。
+- 冻结边的指定选项不计入改动数;冻结边在 DP 中只展开该选项,任何剪枝
+  (支配/窗口/偏差/预算截断)都不会把它换成别的选项。
+- **改动次数只是约束,绝不混入成本**:目标仍为字典序
+  `(总成本, 最大叶延迟, 选项下标向量)`。若两个方案目标值相同,改动更少
+  者不会因此优先。
+- DP 状态额外携带已用改动数(0..K),支配规则要求 `ch_k <= ch_c`,超 K
+  状态当场剪枝;`OPTIMAL`/`INFEASIBLE`/`BUDGET_EXHAUSTED` 三态语义与
+  `solve` 完全一致(预算不足与证明无解严格分开)。
+
 ### 目标与并列序
 
 字典序最小化 `(总成本, 最大叶延迟 M, 选项下标向量)`;选项下标向量按
@@ -118,3 +149,7 @@ res.pruning           # 被剪枝状态分类计数与预算界,见下
 从不导入被测核心;`tests/test_dp.py` 在手工场景(共享干线、不可行窗口、
 零缓冲、非凸选项、并列序、闭区间端点)与 60 组确定性随机小树上对拍最优
 值、最大延迟与每个叶的累加和。对拍之外的路径重建一致性检查仅作补充。
+`tests/test_freeze.py` 覆盖冻结表与改动预算:公共祖先缓冲一处改动同时
+修两叶、冻结导致无解、恰好 K 处改动、等价选项不同下标、K=0 仅验证参考
+方案、冻结边不计入改动,并在 60 组随机小树上与枚举参考(枚举时同样施加
+冻结与 K 约束)对拍选项向量、改动清单与逐叶路径和。

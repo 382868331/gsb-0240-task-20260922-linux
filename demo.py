@@ -11,6 +11,9 @@ prints:
   2. a rejection boundary that is actually triggered (NaN and bool inputs);
   3. the distinction between a *proven* infeasible window set and a
      budget cutoff whose result is explicitly not proven optimal.
+  4. a freeze table plus a change budget K against a reference plan:
+     K=0 validation, one shared-trunk change fixing two leaves, and a
+     frozen edge making the instance provably infeasible.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from skewbudget import (
     Option,
     Status,
     solve,
+    solve_with_reference,
 )
 
 
@@ -130,6 +134,41 @@ def main() -> None:
     full = solve(cut_tree, skew_limit=5)
     print(f"  same instance with the default exhaustive frontier:"
           f" {full.status.value}, cost {full.total_cost}")
+
+    hr("4. FREEZE TABLE + CHANGE BUDGET vs a reference plan")
+    # Same trunk tree; windows now demand arrivals 8 and 11.  The all-zero
+    # reference plan gives 6/9 (infeasible).  A single trunk buffer shifts
+    # BOTH leaves at once, so K=1 suffices -- one change on a shared edge.
+    ref_tree = ClockTree(
+        "r",
+        [Edge("r", "u", 5, [Option(0, 0), Option(2, 4)]),
+         Edge("u", "a", 1, [Option(0, 0), Option(3, 2)]),
+         Edge("u", "b", 4, [Option(0, 0), Option(3, 2)])],
+        [LeafWindow("a", 8, 8), LeafWindow("b", 11, 11)],
+    )
+    reference = {"u": 0, "a": 0, "b": 0}
+    k0 = solve_with_reference(ref_tree, 3, reference, 0)
+    show("K=0: reference plan only (infeasible, proven)", k0)
+    assert k0.status is Status.INFEASIBLE
+
+    k1 = solve_with_reference(ref_tree, 3, reference, 1)
+    show("K=1: one shared-trunk change fixes both leaves", k1)
+    print(f"  changes used : {k1.n_changes} (<= K=1)")
+    for m in k1.modifications:
+        print(f"  modified edge {m.edge!r}: option {m.reference_index}"
+              f" -> {m.chosen_index}")
+    for leaf, chain in k1.leaf_path_edges.items():
+        print(f"  leaf {leaf!r}: path edges {chain},"
+              f" arrival {k1.leaf_arrivals[leaf]}")
+    assert k1.status is Status.OPTIMAL and k1.n_changes == 1
+
+    welded = solve_with_reference(ref_tree, 3, reference, 2,
+                                  frozen={"u": 0})
+    show("trunk frozen to option 0: no layout survives", welded)
+    assert welded.status is Status.INFEASIBLE
+    print("  frozen edge 'u' keeps option 0 in every state; the freeze,"
+          " not pruning, decides -- and infeasibility is proven, not a"
+          " budget cutoff.")
 
     print()
     print(f"demo finished in {time.perf_counter() - t0:.3f} s"
