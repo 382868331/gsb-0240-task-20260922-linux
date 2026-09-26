@@ -9,6 +9,7 @@ Public API:
 
 from .model import (
     MAX_EDGES,
+    Clock,
     ClockTree,
     Edge,
     InputTypeError,
@@ -20,13 +21,16 @@ from .model import (
     TreeValidationError,
 )
 from .dp import PruningInfo, SolveResult, Status, solve, validate_tree
+from .dp import LeafTiming
 
 __all__ = [
     "MAX_EDGES",
+    "Clock",
     "ClockTree",
     "Edge",
     "LeafWindow",
     "Option",
+    "LeafTiming",
     "Status",
     "SolveResult",
     "PruningInfo",

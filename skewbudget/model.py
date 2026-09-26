@@ -74,8 +74,11 @@ def _check_str(value, what: str, path: str) -> str:
 class Option:
     """One discrete buffer choice on an edge.
 
-    delay: added path latency, non-negative integer.
-    cost:  buffer cost, non-negative integer.
+    delay:      added path latency for the RISING edge, non-negative int.
+    cost:       buffer cost, non-negative integer.
+    fall_delay: added path latency for the FALLING edge, non-negative int;
+                None (the default) means same as delay, which degenerates
+                to the single-edge model.
     The zero-buffer choice is ``Option(0, 0)``.  Duplicate delay values are
     allowed (only the cheapest survives preprocessing); non-convex /
     non-dominatable shapes are preserved.
@@ -83,16 +86,23 @@ class Option:
 
     delay: int
     cost: int
+    fall_delay: int | None = None
 
     def __post_init__(self) -> None:
         d = _check_int(self.delay, "Option.delay")
         c = _check_int(self.cost, "Option.cost")
+        f = d if self.fall_delay is None else _check_int(
+            self.fall_delay, "Option.fall_delay"
+        )
         if d < 0:
             raise InputValueError(f"Option.delay must be >= 0, got {d}")
         if c < 0:
             raise InputValueError(f"Option.cost must be >= 0, got {c}")
+        if f < 0:
+            raise InputValueError(f"Option.fall_delay must be >= 0, got {f}")
         object.__setattr__(self, "delay", d)
         object.__setattr__(self, "cost", c)
+        object.__setattr__(self, "fall_delay", f)
 
 
 @dataclass(frozen=True)
@@ -138,19 +148,20 @@ class Edge:
                 raise InputTypeError(
                     f"Edge.options[{i}] must be Option, got {type(opt).__name__}"
                 )
-            # Duplicate delay: keep cheapest; equal delay+cost: first wins.
-            prev = seen_delay.get(opt.delay)
+            # Duplicate edge geometry (rise AND fall delay): keep cheapest;
+            # fully identical options: first wins.
+            prev = seen_delay.get((opt.delay, opt.fall_delay))
             if prev is None or opt.cost < prev:
-                seen_delay[opt.delay] = opt.cost
+                seen_delay[(opt.delay, opt.fall_delay)] = opt.cost
         # Deterministic public option order: input order, dedup keeping
         # cheapest for a delay, never re-sorted.
         kept: set[int] = set()
         for opt in options:
-            if opt.delay in kept:
+            if (opt.delay, opt.fall_delay) in kept:
                 continue
-            if seen_delay[opt.delay] == opt.cost:
+            if seen_delay[(opt.delay, opt.fall_delay)] == opt.cost:
                 opts.append(opt)
-                kept.add(opt.delay)
+                kept.add((opt.delay, opt.fall_delay))
         object.__setattr__(self, "parent", p)
         object.__setattr__(self, "child", c)
         object.__setattr__(self, "base_delay", b)
@@ -159,22 +170,68 @@ class Edge:
 
 @dataclass(frozen=True)
 class LeafWindow:
-    """Closed arrival-time window ``[lo, hi]`` for a leaf (inclusive)."""
+    """Closed arrival-time window ``[lo, hi]`` for a leaf (inclusive).
+
+    lo / hi:   closed bounds on the RISING-edge arrival time at this leaf.
+    min_high:  minimum high-pulse width required at this leaf (>= 0).
+    min_low:   minimum low-pulse width required at this leaf (>= 0).
+    The pulse bounds are only enforced when solve() is given a Clock;
+    both default to 0 (no extra constraint beyond a sane waveform).
+    """
 
     leaf: str
     lo: int
     hi: int
+    min_high: int = 0
+    min_low: int = 0
 
     def __post_init__(self) -> None:
         _check_str(self.leaf, "LeafWindow.leaf", "leaf-window")
         lo = _check_int(self.lo, "LeafWindow.lo")
         hi = _check_int(self.hi, "LeafWindow.hi")
+        mh = _check_int(self.min_high, "LeafWindow.min_high")
+        ml = _check_int(self.min_low, "LeafWindow.min_low")
         if lo > hi:
             raise InputValueError(
                 f"LeafWindow({self.leaf!r}): lo ({lo}) > hi ({hi})"
             )
+        if mh < 0:
+            raise InputValueError(
+                f"LeafWindow({self.leaf!r}): min_high must be >= 0, got {mh}"
+            )
+        if ml < 0:
+            raise InputValueError(
+                f"LeafWindow({self.leaf!r}): min_low must be >= 0, got {ml}"
+            )
         object.__setattr__(self, "lo", lo)
         object.__setattr__(self, "hi", hi)
+        object.__setattr__(self, "min_high", mh)
+        object.__setattr__(self, "min_low", ml)
+
+
+@dataclass(frozen=True)
+class Clock:
+    """Root clock waveform: period and high-phase width (integers).
+
+    The rising edge of cycle 0 is at time 0, the falling edge at
+    ``high_width``; edges repeat every ``period``.  Requires
+    ``period >= 1`` and ``0 <= high_width <= period``.
+    """
+
+    period: int
+    high_width: int
+
+    def __post_init__(self) -> None:
+        p = _check_int(self.period, "Clock.period")
+        h = _check_int(self.high_width, "Clock.high_width")
+        if p < 1:
+            raise InputValueError(f"Clock.period must be >= 1, got {p}")
+        if not 0 <= h <= p:
+            raise InputValueError(
+                f"Clock.high_width must be in [0, period={p}], got {h}"
+            )
+        object.__setattr__(self, "period", p)
+        object.__setattr__(self, "high_width", h)
 
 
 @dataclass(frozen=True)

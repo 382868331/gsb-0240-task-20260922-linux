@@ -12,7 +12,13 @@ Leaf arrival times are stored relative to the time of ``v``:
   for which every leaf window of the subtree can still hold.  Leaf windows
   seed the interval at the leaf; crossing an edge of delay ``d`` shifts it
   to ``[wlo-d, whi-d]``; merging siblings intersects intervals.  ``None``
-  denotes -inf / +inf;
+   denotes -inf / +inf;
+* [plo, phi] -- same construction for the pulse-width constraint when a
+  root clock is given: a leaf seeds the allowed interval of
+  d = t_fall - t_rise as [min_high - high_width,
+  period - min_low - high_width] and crossing an edge shifts it by
+  -(fall_delay - delay) of the chosen option.  Without a clock both
+  bounds stay None and the model degenerates to the single-edge one;
 * ``cost`` -- summed option cost over subtree edges;
 * ``vec``  -- option indices in the subtree's local DFS-preorder edge slots
   (its first entry is the edge to the first child, then that child's
@@ -50,7 +56,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from .model import ClockTree, InputTypeError, InputValueError, _check_int
+from .model import (
+    Clock,
+    ClockTree,
+    InputTypeError,
+    InputValueError,
+    _check_int,
+)
 
 DEFAULT_BUDGET = 4_000
 MIN_BUDGET = 1
@@ -72,6 +84,9 @@ class PruningInfo:
     window_states:    sibling joins whose shifted-window intersection was
                       empty (some leaf window could not be met jointly).
     skew_states:      joins whose leaf envelope already spanned more than S.
+    pulse_states:     joins whose shifted pulse-width intersection was
+                      empty (some leaf's min high/low width could not be
+                      met jointly); 0 when no clock was given.
     budget_states:    assignments dropped solely by the frontier cap.
     cutoff_min_cost:  smallest subtree cost among budget-dropped states -- a
                       cutoff *record*, explicitly NOT an optimality bound;
@@ -82,6 +97,7 @@ class PruningInfo:
     dominated_states: int
     window_states: int
     skew_states: int
+    pulse_states: int
     budget_states: int
     cutoff_min_cost: int | None
     nodes_visited: int
@@ -89,6 +105,26 @@ class PruningInfo:
     @property
     def truncated(self) -> bool:
         return self.budget_states > 0
+
+
+@dataclass(frozen=True)
+class LeafTiming:
+    """Both edge times and pulse widths at one leaf (exact integers).
+
+    Unified absolute-time representation rooted at cycle 0: the root
+    rising edge leaves at t=0 and the root falling edge at
+    clock.high_width, so ``rise`` / ``fall`` are root-relative arrival
+    times of the two edges.  ``fall`` may exceed ``period`` (the falling
+    edge then lands in the next cycle); the solver guarantees
+    ``0 <= fall - rise <= period`` for every reported leaf, i.e. the
+    falling edge never crosses the next rising edge.  ``high`` is the
+    high-pulse width ``fall - rise`` and ``low`` is ``period - high``.
+    """
+
+    rise: int
+    fall: int
+    high: int
+    low: int
 
 
 @dataclass(frozen=True)
@@ -103,6 +139,7 @@ class SolveResult:
     choices: dict[str, int]           # edge id (child label) -> option index
     leaf_arrivals: dict[str, int]     # leaf -> summed root-to-leaf delay
     leaf_path_edges: dict[str, tuple[str, ...]]
+    leaf_timing: dict[str, LeafTiming] | None  # None iff no clock given
     pruning: PruningInfo
     budget: int | None
 
@@ -117,6 +154,8 @@ class _State:
     M: int
     wlo: int | None
     whi: int | None
+    plo: int | None
+    phi: int | None
     cost: int
     vec: tuple[int, ...]
 
@@ -126,6 +165,7 @@ class _Stats:
     dominated: int = 0
     window: int = 0
     skew: int = 0
+    pulse: int = 0
     budget_drops: int = 0
     cutoff: int | None = None
     nodes: int = 0
@@ -168,6 +208,12 @@ def _window_span(s: _State) -> int:
     return _INF_WIDTH
 
 
+def _pulse_span(s: _State) -> int:
+    if s.plo is not None and s.phi is not None:
+        return s.phi - s.plo
+    return _INF_WIDTH
+
+
 def _dominates(k: _State, c: _State) -> bool:
     """Exact dominance under objective (cost, root max-delay M, vec).
 
@@ -188,6 +234,10 @@ def _dominates(k: _State, c: _State) -> bool:
     whi_ok = (k.whi is None) or (c.whi is not None and k.whi >= c.whi)
     if not (wlo_ok and whi_ok):
         return False
+    plo_ok = (k.plo is None) or (c.plo is not None and k.plo <= c.plo)
+    phi_ok = (k.phi is None) or (c.phi is not None and k.phi >= c.phi)
+    if not (plo_ok and phi_ok):
+        return False
     if k.cost < c.cost:
         return True
     return k.vec <= c.vec
@@ -197,7 +247,7 @@ def _pareto(states: list[_State], cap: int, st: _Stats) -> list[_State]:
     """Collapse equal signatures, apply exact dominance, optionally cap."""
     best: dict[tuple, _State] = {}
     for s in states:
-        key = (s.m, s.M, s.wlo, s.whi)
+        key = (s.m, s.M, s.wlo, s.whi, s.plo, s.phi)
         old = best.get(key)
         if old is None or (s.cost, s.vec) < (old.cost, old.vec):
             if old is not None:
@@ -211,6 +261,8 @@ def _pareto(states: list[_State], cap: int, st: _Stats) -> list[_State]:
         s.cost, s.m, s.M,
         s.wlo if s.wlo is not None else -_INF_WIDTH,
         s.whi if s.whi is not None else _INF_WIDTH,
+        s.plo if s.plo is not None else -_INF_WIDTH,
+        s.phi if s.phi is not None else _INF_WIDTH,
         s.vec,
     ))
     kept: list[_State] = []
@@ -229,7 +281,7 @@ def _pareto(states: list[_State], cap: int, st: _Stats) -> list[_State]:
         # envelopes / flexible windows as secondary heuristics, and flag the
         # whole result unproven.
         kept.sort(key=lambda s: (s.cost, s.M, s.M - s.m,
-                                 _window_span(s), s.vec))
+                                 _window_span(s), _pulse_span(s), s.vec))
         for d in kept[cap:]:
             st.record_cutoff(d.cost)
         kept = kept[:cap]
@@ -255,8 +307,18 @@ def validate_tree(tree: ClockTree) -> dict:
 
 
 def solve(tree: ClockTree, skew_limit: int, *,
+          clock: Clock | None = None,
           budget: int | None = DEFAULT_BUDGET) -> SolveResult:
     """Minimise total buffer cost under windows and the global skew bound.
+
+    When a clock is given, every leaf must additionally keep a high
+    pulse of at least window.min_high and a low pulse of at least
+    window.min_low: with root-relative rise/fall sums t_r / t_f the
+    leaf high width is clock.high_width + t_f - t_r and must lie in
+    [min_high, clock.period - min_low] (the upper bound also forbids
+    the falling edge crossing the next rising edge).  Pulse width is a
+    hard feasibility constraint, never a soft objective; the objective
+    order stays (total cost, max rise delay, option vector).
 
     See module docstring for state/dominance semantics and
     :class:`SolveResult` / :class:`Status` for the outcome contract.
@@ -265,6 +327,10 @@ def solve(tree: ClockTree, skew_limit: int, *,
     s_limit = _check_int(skew_limit, "skew_limit")
     if s_limit < 0:
         raise InputValueError(f"skew_limit must be >= 0, got {s_limit}")
+    if clock is not None and not isinstance(clock, Clock):
+        raise InputTypeError(
+            f"clock must be a Clock or None, got {type(clock).__name__}"
+        )
     if budget is None:
         cap = -1
     else:
@@ -283,7 +349,14 @@ def solve(tree: ClockTree, skew_limit: int, *,
         kids = children.get(v)
         if not kids:
             w = windows[v]
-            return [_State(0, 0, w.lo, w.hi, 0, ())]
+            if clock is None:
+                plo = phi = None
+            else:
+                # Pulse constraint as a prefix interval on d = t_f - t_r:
+                # min_high <= high_width + d <= period - min_low.
+                plo = w.min_high - clock.high_width
+                phi = clock.period - clock.high_width - w.min_low
+            return [_State(0, 0, w.lo, w.hi, plo, phi, 0, ())]
 
         frontier: list[_State] = []
         first = True
@@ -297,8 +370,10 @@ def solve(tree: ClockTree, skew_limit: int, *,
                     for opt_idx, opt in enumerate(edge.options):
                         d = edge.base_delay + opt.delay
                         wlo, whi = _shift(cs.wlo, cs.whi, d)
+                        pd = opt.fall_delay - opt.delay
+                        plo, phi = _shift(cs.plo, cs.phi, pd)
                         produced.append(_State(
-                            cs.m + d, cs.M + d, wlo, whi,
+                            cs.m + d, cs.M + d, wlo, whi, plo, phi,
                             cs.cost + opt.cost, (opt_idx,) + cs.vec,
                         ))
                 first = False
@@ -306,6 +381,7 @@ def solve(tree: ClockTree, skew_limit: int, *,
                 for fs in frontier:
                     for opt_idx, opt in enumerate(edge.options):
                         d = edge.base_delay + opt.delay
+                        pd = opt.fall_delay - opt.delay
                         for cs in child_states:
                             wlo, whi = _shift(cs.wlo, cs.whi, d)
                             wint = _intersect(
@@ -313,6 +389,13 @@ def solve(tree: ClockTree, skew_limit: int, *,
                             )
                             if wint is None:
                                 stats.window += 1
+                                continue
+                            plo, phi = _shift(cs.plo, cs.phi, pd)
+                            pint = _intersect(
+                                (fs.plo, fs.phi), (plo, phi)
+                            )
+                            if pint is None:
+                                stats.pulse += 1
                                 continue
                             cm = cs.m + d
                             cM = cs.M + d
@@ -323,6 +406,7 @@ def solve(tree: ClockTree, skew_limit: int, *,
                                 continue
                             produced.append(_State(
                                 em, eM, wint[0], wint[1],
+                                pint[0], pint[1],
                                 fs.cost + opt.cost + cs.cost,
                                 fs.vec + (opt_idx,) + cs.vec,
                             ))
@@ -331,23 +415,24 @@ def solve(tree: ClockTree, skew_limit: int, *,
 
     # Degenerate tree: a lone root, no edges or leaves.  Nothing to choose.
     if tree.n_edges == 0:
-        root_states = [_State(0, 0, None, None, 0, ())]
+        root_states = [_State(0, 0, None, None, None, None, 0, ())]
     else:
         root_states = node_dp(tree.root)
 
     feasible = [
         s for s in root_states
         if (s.wlo is None or s.wlo <= 0) and (s.whi is None or 0 <= s.whi)
+        and (s.plo is None or s.plo <= 0) and (s.phi is None or 0 <= s.phi)
     ]
     info = PruningInfo(
-        stats.dominated, stats.window, stats.skew,
+        stats.dominated, stats.window, stats.skew, stats.pulse,
         stats.budget_drops, stats.cutoff, stats.nodes,
     )
 
     def no_incumbent(reason: Status) -> SolveResult:
         return SolveResult(
             reason, tree, s_limit, None, None, None, None,
-            {}, {}, {}, info, budget,
+            {}, {}, {}, None, info, budget,
         )
 
     if not feasible:
@@ -361,17 +446,19 @@ def solve(tree: ClockTree, skew_limit: int, *,
     best = min(feasible, key=lambda s: (s.cost, s.M, s.vec))
     status = Status.BUDGET_EXHAUSTED if info.truncated else Status.OPTIMAL
 
-    choices, arrivals, paths = _reconstruct(tree, best.vec)
+    choices, arrivals, paths, timing = _reconstruct(tree, best.vec, clock)
     return SolveResult(
         status, tree, s_limit,
         best.cost, best.M, best.m, best.M - best.m,
-        choices, arrivals, paths, info, budget,
+        choices, arrivals, paths, timing, info, budget,
     )
 
 
-def _reconstruct(tree: ClockTree, vec: tuple[int, ...]):
-    """Turn the root preorder option vector into per-edge choices and
-    exact root-to-leaf delay sums."""
+def _reconstruct(tree: ClockTree, vec: tuple[int, ...],
+                 clock: Clock | None):
+    """Turn the root preorder option vector into per-edge choices,
+    exact root-to-leaf rise-delay sums, and (with a clock) per-leaf
+    two-edge timing in the unified absolute representation."""
     choices: dict[str, int] = {}
     pos = 0
 
@@ -386,17 +473,27 @@ def _reconstruct(tree: ClockTree, vec: tuple[int, ...]):
 
     arrivals: dict[str, int] = {}
     paths: dict[str, tuple[str, ...]] = {}
+    timing: dict[str, LeafTiming] | None = {} if clock is not None else None
     for leaf in sorted(tree.leaf_set):
         chain: list[str] = []
         v = leaf
         total = 0
+        fall_total = 0
         while v != tree.root:
             e = tree.parent_edge[v]
             oi = choices[v]
             total += e.base_delay + e.options[oi].delay
+            fall_total += e.base_delay + e.options[oi].fall_delay
             chain.append(v)  # edge identified by its child endpoint
             v = e.parent
         chain.reverse()
         arrivals[leaf] = total
         paths[leaf] = tuple(chain)
-    return choices, arrivals, paths
+        if timing is not None:
+            fall = clock.high_width + fall_total
+            high = fall - total
+            timing[leaf] = LeafTiming(
+                rise=total, fall=fall, high=high,
+                low=clock.period - high,
+            )
+    return choices, arrivals, paths, timing
