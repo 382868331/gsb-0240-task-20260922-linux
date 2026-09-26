@@ -16,10 +16,18 @@ from .model import (
     InvalidNumericError,
     LeafWindow,
     Option,
+    RootClock,
     SkewBudgetError,
     TreeValidationError,
 )
-from .dp import PruningInfo, SolveResult, Status, solve, validate_tree
+from .dp import (
+    LeafTiming,
+    PruningInfo,
+    SolveResult,
+    Status,
+    solve,
+    validate_tree,
+)
 
 __all__ = [
     "MAX_EDGES",
@@ -27,9 +35,11 @@ __all__ = [
     "Edge",
     "LeafWindow",
     "Option",
+    "RootClock",
     "Status",
     "SolveResult",
     "PruningInfo",
+    "LeafTiming",
     "solve",
     "validate_tree",
     "SkewBudgetError",

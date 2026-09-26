@@ -76,6 +76,10 @@ class Option:
 
     delay: added path latency, non-negative integer.
     cost:  buffer cost, non-negative integer.
+    rise_delay / fall_delay: added latency for the rising and falling
+        clock edge respectively.  Both default to ``delay``, so an Option
+        built the old way delays both edges equally and the pulse-width
+        constraints degenerate to the original single-edge problem.
     The zero-buffer choice is ``Option(0, 0)``.  Duplicate delay values are
     allowed (only the cheapest survives preprocessing); non-convex /
     non-dominatable shapes are preserved.
@@ -83,6 +87,8 @@ class Option:
 
     delay: int
     cost: int
+    rise_delay: int | None = None
+    fall_delay: int | None = None
 
     def __post_init__(self) -> None:
         d = _check_int(self.delay, "Option.delay")
@@ -91,8 +97,43 @@ class Option:
             raise InputValueError(f"Option.delay must be >= 0, got {d}")
         if c < 0:
             raise InputValueError(f"Option.cost must be >= 0, got {c}")
+        rd = d if self.rise_delay is None else _check_int(
+            self.rise_delay, "Option.rise_delay")
+        fd = d if self.fall_delay is None else _check_int(
+            self.fall_delay, "Option.fall_delay")
+        if rd < 0:
+            raise InputValueError(f"Option.rise_delay must be >= 0, got {rd}")
+        if fd < 0:
+            raise InputValueError(f"Option.fall_delay must be >= 0, got {fd}")
         object.__setattr__(self, "delay", d)
         object.__setattr__(self, "cost", c)
+        object.__setattr__(self, "rise_delay", rd)
+        object.__setattr__(self, "fall_delay", fd)
+
+
+@dataclass(frozen=True)
+class RootClock:
+    """Root clock waveform: rising edges at k*period, falling edges at
+    k*period + high_width.  Single corner, ideal rectangular source.
+
+    period:     clock period, integer >= 1.
+    high_width: source high-pulse width, 0 <= high_width <= period.
+    """
+
+    period: int
+    high_width: int
+
+    def __post_init__(self) -> None:
+        p = _check_int(self.period, "RootClock.period")
+        h = _check_int(self.high_width, "RootClock.high_width")
+        if p < 1:
+            raise InputValueError(f"RootClock.period must be >= 1, got {p}")
+        if not (0 <= h <= p):
+            raise InputValueError(
+                f"RootClock.high_width must be in [0, period], got {h}"
+            )
+        object.__setattr__(self, "period", p)
+        object.__setattr__(self, "high_width", h)
 
 
 @dataclass(frozen=True)
@@ -132,25 +173,30 @@ class Edge:
                 f"limit is {MAX_OPTIONS_PER_EDGE}"
             )
         opts: list[Option] = []
-        seen_delay: dict[int, int] = {}
+        seen_delay: dict[tuple[int, int, int], int] = {}
         for i, opt in enumerate(options):
             if not isinstance(opt, Option):
                 raise InputTypeError(
                     f"Edge.options[{i}] must be Option, got {type(opt).__name__}"
                 )
-            # Duplicate delay: keep cheapest; equal delay+cost: first wins.
-            prev = seen_delay.get(opt.delay)
+            # Identical timing triple (delay, rise_delay, fall_delay):
+            # keep cheapest; equal timing+cost: first occurrence wins.
+            # Same nominal delay but different rise/fall delays are
+            # different physical options and must both be preserved.
+            key = (opt.delay, opt.rise_delay, opt.fall_delay)
+            prev = seen_delay.get(key)
             if prev is None or opt.cost < prev:
-                seen_delay[opt.delay] = opt.cost
+                seen_delay[key] = opt.cost
         # Deterministic public option order: input order, dedup keeping
-        # cheapest for a delay, never re-sorted.
+        # cheapest for a timing triple, never re-sorted.
         kept: set[int] = set()
         for opt in options:
-            if opt.delay in kept:
+            key = (opt.delay, opt.rise_delay, opt.fall_delay)
+            if key in kept:
                 continue
-            if seen_delay[opt.delay] == opt.cost:
+            if seen_delay[key] == opt.cost:
                 opts.append(opt)
-                kept.add(opt.delay)
+                kept.add(key)
         object.__setattr__(self, "parent", p)
         object.__setattr__(self, "child", c)
         object.__setattr__(self, "base_delay", b)
@@ -159,11 +205,19 @@ class Edge:
 
 @dataclass(frozen=True)
 class LeafWindow:
-    """Closed arrival-time window ``[lo, hi]`` for a leaf (inclusive)."""
+    """Closed arrival-time window ``[lo, hi]`` for a leaf (inclusive).
+
+    min_high / min_low: minimum high / low pulse width required at this
+    leaf when a RootClock is supplied to ``solve``; both default to 0
+    (no pulse requirement beyond the fall edge not being allowed to
+    cross the next rising edge).
+    """
 
     leaf: str
     lo: int
     hi: int
+    min_high: int = 0
+    min_low: int = 0
 
     def __post_init__(self) -> None:
         _check_str(self.leaf, "LeafWindow.leaf", "leaf-window")
@@ -173,8 +227,20 @@ class LeafWindow:
             raise InputValueError(
                 f"LeafWindow({self.leaf!r}): lo ({lo}) > hi ({hi})"
             )
+        mh = _check_int(self.min_high, "LeafWindow.min_high")
+        ml = _check_int(self.min_low, "LeafWindow.min_low")
+        if mh < 0:
+            raise InputValueError(
+                f"LeafWindow.min_high must be >= 0, got {mh}"
+            )
+        if ml < 0:
+            raise InputValueError(
+                f"LeafWindow.min_low must be >= 0, got {ml}"
+            )
         object.__setattr__(self, "lo", lo)
         object.__setattr__(self, "hi", hi)
+        object.__setattr__(self, "min_high", mh)
+        object.__setattr__(self, "min_low", ml)
 
 
 @dataclass(frozen=True)

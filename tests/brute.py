@@ -13,8 +13,14 @@ from itertools import product
 from skewbudget.model import ClockTree
 
 
-def enumerate_solutions(tree: ClockTree, skew_limit: int):
-    """Return all feasible assignments as dicts child_label -> option idx."""
+def enumerate_solutions(tree: ClockTree, skew_limit: int, clock=None):
+    """Return all feasible assignments as dicts child_label -> option idx.
+
+    When ``clock`` (a RootClock) is given, each leaf must additionally
+    meet its min_high / min_low pulse widths, and a fall edge past the
+    next rising edge is rejected -- scored directly from the model,
+    never via the DP core.
+    """
     edges_by_child = {ch: e for e in tree.edges for ch in (e.child,)}
     children_sorted = sorted(edges_by_child)
     choices_ranges = [range(len(edges_by_child[ch].options))
@@ -23,15 +29,19 @@ def enumerate_solutions(tree: ClockTree, skew_limit: int):
     for combo in product(*choices_ranges):
         choice = dict(zip(children_sorted, combo))
         arrivals = {}
+        falls = {}
         for leaf in tree.leaf_set:
             total = 0
+            fall_total = 0
             v = leaf
             while v != tree.root:
                 e = edges_by_child[v]
                 oi = choice[v]
-                total += e.base_delay + e.options[oi].delay
+                total += e.base_delay + e.options[oi].rise_delay
+                fall_total += e.base_delay + e.options[oi].fall_delay
                 v = e.parent
             arrivals[leaf] = total
+            falls[leaf] = fall_total
         cost = sum(edges_by_child[ch].options[oi].cost
                    for ch, oi in choice.items())
         if not arrivals:
@@ -46,14 +56,23 @@ def enumerate_solutions(tree: ClockTree, skew_limit: int):
             if not (w.lo <= arrivals[w.leaf] <= w.hi):
                 ok = False
                 break
+        if ok and clock is not None:
+            for w in tree.windows:
+                high = clock.high_width + falls[w.leaf] - arrivals[w.leaf]
+                low = clock.period - high
+                # high < min_high: pulse vanished; low < min_low (in
+                # particular low < 0): fall edge crossed the next rise.
+                if high < w.min_high or low < w.min_low:
+                    ok = False
+                    break
         if ok:
             out.append((choice, arrivals, cost, hi, lo))
     return out
 
 
-def optimal_reference(tree: ClockTree, skew_limit: int):
+def optimal_reference(tree: ClockTree, skew_limit: int, clock=None):
     """Canonical optimum: min (cost, max delay, option vector)."""
-    feasible = enumerate_solutions(tree, skew_limit)
+    feasible = enumerate_solutions(tree, skew_limit, clock)
     if not feasible:
         return None
     # Canonical vector follows the tree's public DFS-preorder edge slots.
